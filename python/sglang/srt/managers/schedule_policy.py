@@ -1470,6 +1470,7 @@ class PrefillAdder:
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
                         swa_host_hit_length=req.swa_host_hit_length,
+                        auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
                         chunk_limit=self.rem_chunk_tokens,
                     ):
                         self._defer_staged_for_capacity_if_idle(
