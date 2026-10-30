@@ -58,6 +58,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -1416,7 +1417,9 @@ def compute_position(
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
 ):
-    if support_triton(attn_backend):
+    if support_triton(attn_backend) and not get_bool_env_var(
+        "SGLANG_USE_TORCH_COMPUTE_POSITION", "False"
+    ):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
