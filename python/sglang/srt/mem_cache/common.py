@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.triton_ops.common import (
     write_req_to_token_pool_triton,
 )
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_hip, support_triton
+from sglang.srt.utils import get_bool_env_var, is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
 
 _is_hip = is_hip()
@@ -74,7 +74,9 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if support_triton(get_global_server_args().attention_backend) and not get_bool_env_var(
+        "SGLANG_USE_TORCH_CACHE_INDEX_WRITE", "False"
+    ):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
