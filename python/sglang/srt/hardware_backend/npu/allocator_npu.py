@@ -6,7 +6,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -24,6 +24,9 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.roundup = page_size - 1
+        self.use_naive_alloc_extend = get_bool_env_var(
+            "SGLANG_NPU_USE_NAIVE_ALLOC_EXTEND", "False"
+        )
 
     def alloc_extend(
         self,
@@ -54,7 +57,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        if num_new_pages_item < 200:
+        if num_new_pages_item < 200 and not self.use_naive_alloc_extend:
             from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
 
             out_indices = torch.empty(
