@@ -27,6 +27,8 @@ import msgspec
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_SUPPORTED_FPS,
+    PIKA_H3_FLEX_ASPECT_RATIOS,
+    PIKA_H3_FLEX_BUCKETS,
     warn_unverified_short_edge,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
@@ -97,7 +99,7 @@ def _nearest_multiple(value: float, multiple: int) -> int:
     return max(multiple, int(round(float(value) / multiple)) * multiple)
 
 
-def _validate_base_short_edge(value: Any) -> int:
+def _validate_base_short_edge(value: Any, *, warn_unverified: bool = True) -> int:
     try:
         short_edge = int(value)
     except (TypeError, ValueError) as exc:
@@ -106,7 +108,7 @@ def _validate_base_short_edge(value: Any) -> int:
         ) from exc
     if short_edge != value or short_edge <= 0:
         raise ValueError(f"target.short_edge must be a positive integer, got {value!r}")
-    if short_edge != MINIMAX_H3_BASE_SHORT_EDGE:
+    if warn_unverified and short_edge != MINIMAX_H3_BASE_SHORT_EDGE:
         warn_unverified_short_edge(short_edge)
     return short_edge
 
@@ -116,6 +118,7 @@ def minimax_h3_resolve_spatial_shape(
     width: int | float,
     height: int | float,
     base_short_edge: int = MINIMAX_H3_BASE_SHORT_EDGE,
+    max_pixels: int = MINIMAX_H3_MAX_PIXELS,
 ) -> dict[str, Any]:
     """Resolve one display ratio with the ``adapt_shape_v1`` math.
 
@@ -125,7 +128,10 @@ def minimax_h3_resolve_spatial_shape(
     The returned dimensions are always 32px aligned; nearest-grid rounding may
     leave the final area slightly above the pre-round soft pixel budget.
     """
-    base_short_edge = _validate_base_short_edge(base_short_edge)
+    base_short_edge = _validate_base_short_edge(
+        base_short_edge,
+        warn_unverified=not (base_short_edge == 480 and max_pixels == 480 * 832),
+    )
     try:
         source_width = float(width)
         source_height = float(height)
@@ -157,9 +163,9 @@ def minimax_h3_resolve_spatial_shape(
         nominal_width = float(base_short_edge)
         nominal_height = float(base_short_edge) / ratio
     nominal_area = nominal_width * nominal_height
-    if nominal_area > MINIMAX_H3_MAX_PIXELS:
+    if nominal_area > max_pixels:
         size_mode = "area"
-        scale = math.sqrt(float(MINIMAX_H3_MAX_PIXELS) / nominal_area)
+        scale = math.sqrt(float(max_pixels) / nominal_area)
         nominal_width *= scale
         nominal_height *= scale
     else:
@@ -174,7 +180,7 @@ def minimax_h3_resolve_spatial_shape(
         "base_short_edge": base_short_edge,
         "effective_short_edge": min(resolved_width, resolved_height),
         "size_mode": size_mode,
-        "max_pixels": MINIMAX_H3_MAX_PIXELS,
+        "max_pixels": max_pixels,
         "multiple": MINIMAX_H3_CANVAS_MULTIPLE,
         "rounding": "nearest",
         "width": resolved_width,
@@ -188,6 +194,7 @@ def _resolve_shape(
     geometry_source: str,
     auto_aspect_ratio: str | None = None,
     auto_geometry_source: str | None = None,
+    request_policy: str | None = None,
 ) -> dict[str, Any]:
     fps = MINIMAX_H3_SUPPORTED_FPS
     if "duration_seconds" not in target:
@@ -204,6 +211,7 @@ def _resolve_shape(
             target,
             auto_aspect_ratio=auto_aspect_ratio,
             auto_geometry_source=auto_geometry_source,
+            request_policy=request_policy,
         )
     frame_count = minimax_h3_align_frame_count(
         int(round(float(target["duration_seconds"]) * fps))
@@ -221,6 +229,7 @@ def _resolve_shape(
         target,
         auto_aspect_ratio=auto_aspect_ratio,
         auto_geometry_source=auto_geometry_source,
+        request_policy=request_policy,
     )
 
 
@@ -230,7 +239,30 @@ def _resolve_spatial(
     *,
     auto_aspect_ratio: str | None,
     auto_geometry_source: str | None,
+    request_policy: str | None = None,
 ) -> dict[str, Any]:
+    if request_policy == "pika_h3_flex":
+        tier = target["short_edge"]
+        width, height = PIKA_H3_FLEX_BUCKETS[tier][
+            PIKA_H3_FLEX_ASPECT_RATIOS.index(target["aspect_ratio"])
+        ]
+        shape.update(
+            width=width,
+            height=height,
+            geometry="resolved_v2",
+            geometry_source="request",
+            shape_policy_version="pika_h3_flex",
+            base_short_edge=tier,
+            effective_short_edge=min(width, height),
+            size_mode="bucket",
+            multiple=32,
+            rounding="nearest",
+            max_pixels=480 * 832 if tier == 480 else 768 * 1344,
+            keyframe_fit="source_crop",
+            reference_short_edge=1024 if tier == 480 else 2048,
+        )
+        return shape
+
     aspect_ratio = str(target["aspect_ratio"])
     base_short_edge = _validate_base_short_edge(target.get("short_edge"))
     if aspect_ratio == "auto":
@@ -268,6 +300,7 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
         "seed",
         "flow_shift",
         "audio_flow_shift",
+        "request_policy",
     }
     unknown = set(canonical) - allowed_keys
     if unknown:
@@ -311,11 +344,16 @@ def minimax_h3_resolve_plan(canonical: Mapping[str, Any]) -> MiniMaxH3ResolvedPl
                 "conditions with frame_index [0], [-1], or [0, -1], got "
                 f"{signatures!r}"
             )
+    request_policy = canonical.get("request_policy")
+    if request_policy not in (None, "pika_h3_flex"):
+        raise ValueError(f"unknown MiniMax H3 request policy {request_policy!r}")
+    target = canonical["target"]
     shape = _resolve_shape(
-        canonical["target"],
+        target,
         geometry_source=profile.geometry_source,
         auto_aspect_ratio=profile.auto_aspect_ratio,
         auto_geometry_source=profile.auto_geometry_source,
+        request_policy=request_policy,
     )
 
     materials: list[MiniMaxH3MaterialPlanItem] = []

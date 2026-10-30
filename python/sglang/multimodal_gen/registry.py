@@ -383,7 +383,10 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
-        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
+        if (
+            registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS
+            or registered_model_hf_id.lower() == "pika-labs/pika-h3-flex"
+        ):
             continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
@@ -407,6 +410,11 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
         cache_repo_fragment = (
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
+        if (
+            registered_model_hf_id.lower() == "pika-labs/pika-h3-flex"
+            and cache_repo_fragment not in normalized_model_path.split("/")
+        ):
+            continue
         if cache_repo_fragment in normalized_model_path:
             logger.debug(
                 "Resolved HuggingFace cache path '%s' to registered model '%s'.",
@@ -637,6 +645,11 @@ def get_model_info(
 
     # 2. Get pipeline class - check non-diffusers models first
     pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_class_name is None and model_id is not None:
+        explicit_model_path = (
+            "Pika-Labs/Pika-H3-Flex" if model_id.lower() == "pika-h3-flex" else model_id
+        )
+        pipeline_class_name = get_non_diffusers_pipeline_name(explicit_model_path)
     if pipeline_class_name:
         # Known non-diffusers model, skip model_index.json download
         logger.debug(
@@ -730,6 +743,11 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
         return "Flux3ImagePipeline"
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
+    if (
+        normalized_model_path == "pika-labs/pika-h3-flex"
+        or "models--pika-labs--pika-h3-flex" in normalized_model_path.split("/")
+    ):
+        return "PikaH3FlexPipeline"
     model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
         pattern = pattern.lower()

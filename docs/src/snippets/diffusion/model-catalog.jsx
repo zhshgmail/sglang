@@ -241,6 +241,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3",
     },
     {
+      name: "Pika H3 Flex",
+      modelIds: ["Pika-Labs/Pika-H3-Flex"],
+      cookbook: "/cookbook/diffusion/MiniMax/Pika-H3-Flex",
+    },
+    {
       name: "FastH3",
       modelIds: [
         "FastVideo/FastVideo-FastH3-8-Step-V2",

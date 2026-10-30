@@ -1,15 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 from dataclasses import replace
+from pathlib import Path
+
+import torch
+from huggingface_hub import snapshot_download
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
+    PikaH3FlexPipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    MiniMaxH3SamplingParams,
+    PikaH3FlexSamplingParams,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -208,6 +218,9 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 pipeline=self,
+                sampler=release_metadata.sampler
+                if release_metadata is not None
+                else "euler",
             )
         )
         self.add_stage(
@@ -227,6 +240,108 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
+class PikaH3FlexPipeline(MiniMaxH3Pipeline):
+    pipeline_name = "PikaH3FlexPipeline"
+    pipeline_config_cls = PikaH3FlexPipelineConfig
+    sampling_params_cls = PikaH3FlexSamplingParams
+    model_revision = "0ddf55ad7067ca1e76812253bd7b4600df87f759"
+    base_repo = "MiniMaxAI/MiniMax-H3"
+    base_revision = "42ed227ee7df40d41602854ae760620d6eb651fe"
+
+    def load_lora_adapter(
+        self,
+        lora_path: str,
+        lora_nickname: str,
+        rank: int,
+        weight_name: str | None = None,
+        lora_alpha: int | None = None,
+    ) -> None:
+        super().load_lora_adapter(
+            lora_path, lora_nickname, rank, weight_name, lora_alpha
+        )
+        # Release files store FP32 masters; inference uses BF16 adapter factors.
+        self.lora_adapters[lora_nickname] = {
+            name: weight.to(torch.bfloat16)
+            for name, weight in self.lora_adapters[lora_nickname].items()
+        }
+
+    def _load_config(self):
+        # The released adapters require FP32 matmuls at FP32 module boundaries.
+        torch.set_float32_matmul_precision("highest")
+        variant = self.server_args.model_variant or "fl2va"
+        if self.server_args.revision not in (None, self.model_revision):
+            raise ValueError(
+                f"Pika H3 Flex requires model revision {self.model_revision}"
+            )
+        adapter_root = Path(self.model_path)
+        if not adapter_root.is_dir():
+            adapter_root = Path(
+                snapshot_download(
+                    self.model_path,
+                    revision=self.model_revision,
+                    allow_patterns=[f"{variant}/*", "LICENSE", "NOTICE", "licenses/*"],
+                )
+            )
+        with (adapter_root / variant / "manifest.json").open() as file:
+            manifest = json.load(file)
+        expected_policy = (
+            "fp32_conditioning_v1" if variant == "ref2va" else "bf16_conditioning_v1"
+        )
+        expected_sampling = {
+            "knots": [1000, 750, 500, 250, 100, 40, 0],
+            "video_shift": 12.0,
+            "audio_shift": 3.0,
+            "method": "renoise",
+        }
+        expected = {
+            "format_version": 1,
+            "rank": 128,
+            "alpha": 128,
+            "task": variant,
+            "trunk": "transformer_ref" if variant == "ref2va" else "transformer",
+            "numerics_policy": expected_policy,
+            "sampling": expected_sampling,
+            "base": {"repo_id": self.base_repo, "revision": self.base_revision},
+            "target_modules": [
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "ff.net.0.proj",
+                "ff.net.2",
+            ],
+        }
+        for name, value in expected.items():
+            if manifest.get(name) != value:
+                raise ValueError(
+                    f"Pika H3 Flex adapter manifest has an unsupported {name}"
+                )
+        adapter_path = adapter_root / variant / "adapter.safetensors"
+        checksum = hashlib.sha256()
+        with adapter_path.open("rb") as file:
+            for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
+                checksum.update(chunk)
+        if checksum.hexdigest() != manifest.get("sha256"):
+            raise ValueError("Pika H3 Flex adapter checksum mismatch")
+        subfolder = self.model_subfolder_for_variant(variant)
+        self.model_path = snapshot_download(
+            self.base_repo,
+            revision=self.base_revision,
+            allow_patterns=[f"{subfolder}/**", "LICENSE", "NOTICE", "licenses/*"],
+        )
+        self.server_args.model_variant = variant
+        self.server_args.lora_path = str(adapter_path)
+        self.server_args.lora_alpha = manifest["alpha"]
+        model_index = super()._load_config()
+        model_index["_minimax_h3"].update(
+            dmd_denoising_steps=manifest["sampling"]["knots"][:-1],
+            sigma_shift_scales={"video": 12.0, "audio": 3.0},
+            sampler=manifest["sampling"]["method"],
+        )
+        self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
+        return model_index
+
+
 class FastH3Pipeline(MiniMaxH3Pipeline):
     """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only), and the
     FastH3 Omni Ref2VA PDD student.
@@ -241,4 +356,4 @@ class FastH3Pipeline(MiniMaxH3Pipeline):
     default_model_subfolder = None
 
 
-EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline]
+EntryClass = [MiniMaxH3Pipeline, FastH3Pipeline, PikaH3FlexPipeline]

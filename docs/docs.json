@@ -1666,7 +1666,8 @@
                   {
                     "group": "MiniMax",
                     "pages": [
-                      "cookbook/diffusion/MiniMax/MiniMax-H3"
+                      "cookbook/diffusion/MiniMax/MiniMax-H3",
+                      "cookbook/diffusion/MiniMax/Pika-H3-Flex"
                     ]
                   },
                   {

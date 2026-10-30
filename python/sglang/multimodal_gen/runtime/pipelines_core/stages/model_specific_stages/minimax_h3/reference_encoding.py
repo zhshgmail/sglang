@@ -133,6 +133,7 @@ def minimax_h3_resolve_reference_image_shape(
     canvas_width: int | float,
     canvas_height: int | float,
     mode: str = "diffusers",
+    reference_short_edge: int = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE,
 ) -> dict[str, Any]:
     """Resolve a ref2va image with a selectable resize policy.
 
@@ -191,7 +192,7 @@ def minimax_h3_resolve_reference_image_shape(
     elif mode == "max":
         scale = min(1.0, MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge)
     else:  # diffusers
-        scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge
+        scale = reference_short_edge / short_edge
 
     resolved_width = _nearest_multiple(
         source_width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
@@ -213,7 +214,7 @@ def minimax_h3_resolve_reference_image_shape(
         ),
         # Keep the legacy short-edge metadata for shape-schema compatibility.
         # ``match`` does not use this value in its scale calculation.
-        "base_short_edge": MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE,
+        "base_short_edge": reference_short_edge,
         "effective_short_edge": min(resolved_width, resolved_height),
         "reference_resize_mode": mode,
         "size_mode": size_mode,

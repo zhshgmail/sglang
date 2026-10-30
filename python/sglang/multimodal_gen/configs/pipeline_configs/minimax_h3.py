@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -343,6 +344,35 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
 
 @dataclass
+class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
+    """Six-step consistency adapters over the native MiniMax H3 partitions."""
+
+    def validate_server_args(self, server_args) -> None:
+        if envs.SGLANG_CACHE_DIT_ENABLED:
+            raise ValueError(
+                "Pika H3 Flex requires all six denoiser evaluations; "
+                "disable SGLANG_CACHE_DIT_ENABLED"
+            )
+        if server_args.model_variant not in (None, "fl2va", "ref2va"):
+            raise ValueError("Pika H3 Flex model_variant must be fl2va or ref2va")
+        if server_args.lora_path is not None:
+            raise ValueError(
+                "Pika H3 Flex loads its matching release adapter automatically"
+            )
+        if server_args.lora_alpha not in (None, 128) or server_args.lora_scale != 1.0:
+            raise ValueError("Pika H3 Flex requires LoRA alpha 128 and scale 1.0")
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "dynamic"
+        super().validate_server_args(server_args)
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'Pika H3 Flex has no audited quality="high" deployment; '
+            'use quality="exact" or the default "lossless"'
+        )
+
+
+@dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
 
@@ -435,6 +465,7 @@ __all__ = [
     "FastH3OmniPipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
+    "PikaH3FlexPipelineConfig",
 ]
 
 
@@ -443,6 +474,7 @@ def register():
         FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
 
@@ -484,4 +516,11 @@ def register():
                 "fasth3omni" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
+    )
+
+    register_configs(
+        sampling_param_cls=PikaH3FlexSamplingParams,
+        pipeline_config_cls=PikaH3FlexPipelineConfig,
+        hf_model_paths=["Pika-Labs/Pika-H3-Flex"],
+        model_detectors=[lambda model_id: model_id.lower() == "pika-labs/pika-h3-flex"],
     )

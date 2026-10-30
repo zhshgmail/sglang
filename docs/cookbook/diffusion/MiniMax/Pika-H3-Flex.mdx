@@ -1,0 +1,279 @@
+---
+title: Pika H3 Flex
+description: Serve Pika H3 Flex natively with six-step video and stereo audio generation.
+---
+
+import { DiffusionModelTags } from "/src/snippets/diffusion/model-tags.jsx";
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/Pika-Labs/pika-h3-flex.jsx";
+
+<DiffusionModelTags
+  tags={[
+    "video + audio",
+    "six steps",
+    "first / last frame",
+    "multimodal references",
+    "480p / 768p",
+  ]}
+/>
+
+## 1. Quick start
+
+Install from an SGLang source checkout containing this integration, following the
+[diffusion installation guide](/docs/sglang-diffusion/installation). The recipes
+below were tested with Python 3.12 and PyTorch 2.14.1+cu130 on B200. Published
+container coverage has not been verified.
+
+```bash
+uv pip install -e "python[diffusion]" --prerelease=allow
+```
+
+<Deployment config={config} />
+
+Set the media variables to files readable by the server for conditioned tasks.
+The request returns a video job; poll `GET /v1/videos/{id}` until it completes,
+then download `GET /v1/videos/{id}/content` to save the MP4. The MP4 contains
+both the video and its generated stereo soundtrack.
+
+<Note>
+  Use the root model ID. SGLang verifies the pinned adapter manifest and
+  SHA-256, loads the corresponding pinned MiniMax-H3 base partition, and
+  attaches the adapter automatically. Changing between FL2VA and Ref2VA requires
+  restarting the server.
+</Note>
+
+## 2. Model capabilities
+
+[Pika H3 Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex) adapts MiniMax-H3
+for joint video and audio generation in six model evaluations. Use it for text
+prompts, first/last-frame control, or image, video, and audio references.
+It reuses SGLang's native MiniMax-H3 architecture and stages.
+
+Choose the FL2VA deployment for text and frame anchors, or Ref2VA for visual
+references with optional audio. Both generate a video and soundtrack together;
+the released canvases cover 480p and 768p.
+
+<Note>
+  Each deployment loads one adapter partition. Select the matching task in the
+  picker before copying the server command.
+</Note>
+
+<table>
+  <thead>
+    <tr>
+      <th>Task</th>
+      <th>Adapter variant</th>
+      <th>Inputs</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>
+        <code>t2va</code>
+      </td>
+      <td>
+        <code>fl2va</code>
+      </td>
+      <td>Text prompt</td>
+    </tr>
+    <tr>
+      <td>
+        <code>i2va</code>
+      </td>
+      <td>
+        <code>fl2va</code>
+      </td>
+      <td>First frame</td>
+    </tr>
+    <tr>
+      <td>
+        <code>l2va</code>
+      </td>
+      <td>
+        <code>fl2va</code>
+      </td>
+      <td>Last frame</td>
+    </tr>
+    <tr>
+      <td>
+        <code>fl2va</code>
+      </td>
+      <td>
+        <code>fl2va</code>
+      </td>
+      <td>First and last frames</td>
+    </tr>
+    <tr>
+      <td>
+        <code>ref2va</code>
+      </td>
+      <td>
+        <code>ref2va</code>
+      </td>
+      <td>At least one image or video; optional audio references</td>
+    </tr>
+  </tbody>
+</table>
+
+The sampler uses the released knots `[1000, 750, 500, 250, 100, 40, 0]`, video
+shift 12, and audio shift 3. Each step predicts a clean sample and adds fresh
+noise at the next level; the last step returns the clean sample. Six-step Euler
+sampling is not equivalent. Keep `num_inference_steps` at 6 and guidance at 1.
+The runtime rejects unsupported step counts and approximate step caches.
+
+Output uses 24 fps and 32 kHz stereo audio, with one output per request. Frame
+counts follow `17n + 5`: five seconds gives 124 frames and fifteen gives 362.
+The released canvases cover 480p and 768p across eleven aspect ratios. For
+16:9, they are 832×480 and 1344×768; the picker emits the tier and aspect ratio.
+Keyframes are center-cropped to the selected canvas. Arbitrary dimensions and
+hybrid keyframe-plus-reference requests are outside this Pika release contract.
+
+Ref2VA accepts up to nine images, three videos, three audio clips, and twelve
+references total. Each clip must be 2–15 seconds; total video duration and total
+audio duration must each be at most 15 seconds. Visual reference rows receive
+one request-seeded noise augmentation; audio reference rows stay clean.
+
+The upsampler, audio-stem separation, and prompt rewriter are not included in
+this release. Model and adapter weights use the MiniMax H3 Community License;
+include Pika's NOTICE when redistributing them. See the
+[model card](https://huggingface.co/Pika-Labs/Pika-H3-Flex) for terms.
+
+## 3. Deployment and precision
+
+Both rank-128 adapters use alpha 128 and scale 1. SGLang keeps Pika adapters
+unmerged by default, casting the FP32 checkpoint factors to BF16 for inference. Explicit
+`--lora-merge-mode auto` and `merge` are supported by the inherited LoRA loader,
+but merging changes BF16 rounding and can change generated details. Do not use
+a merged run as the lossless reference recipe. On the pinned adapters, `auto`
+measured rounding losses of 39.8% (FL2VA) and 39.4% (Ref2VA) by update norm,
+below its 50% threshold, and selected merging.
+
+The native path uses FP32 AdaLN SiLU, disables TF32 matrix multiplication, and
+preserves the released conditioning precision: BF16 for FL2VA and FP32 latent
+conditioning for Ref2VA. `quality="lossless"` enables the inherited validated
+VAE fast paths; `quality="exact"` selects the original VAE module operations.
+Neither mode implies bitwise identity across different attention kernels,
+software versions, or GPU counts.
+
+H100 and H200 recipes are derived from a source audit and have **not** been run
+on those GPUs for Pika. Hopper selects FA3; Blackwell selects FA4. The CUDA VAE
+path retains unfused and attention fallbacks. A single H100 needs offloading;
+multi-GPU H100 recipes use tensor parallelism as well as Ulysses. Memory grows
+with resolution, duration, references, and graph buckets, so the 768p/15-second
+resident B200 recipe is not a single-H200 capacity claim.
+
+### B200 measurements
+
+The picker selects eager execution on one B200 and
+eager with TP1/Ulysses4 on four B200s
+for the measured text workload. These are the lowest observed warm medians
+among eager, CUDA graph, and compiled runs. The table also includes the best
+measured mode for the alternative four-GPU topology.
+
+<table>
+  <thead>
+    <tr>
+      <th>B200s</th>
+      <th>TP / Ulysses</th>
+      <th>Mode</th>
+      <th>Init median (s)</th>
+      <th>Warm denoise (s)</th>
+      <th>Warm saved E2E median (range), s</th>
+      <th>Runtime / load peak (GiB/GPU)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>1 / 1</td>
+      <td>eager</td>
+      <td>62.8</td>
+      <td>3.703</td>
+      <td>5.390 (5.363–5.413)</td>
+      <td>122.9 / 124.8</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>1 / 4</td>
+      <td>eager</td>
+      <td>78.7</td>
+      <td>1.120</td>
+      <td>1.698 (1.688–1.722)</td>
+      <td>85.4 / 90.1</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>2 / 2</td>
+      <td>eager</td>
+      <td>61.1</td>
+      <td>1.187</td>
+      <td>1.774 (1.763–1.782)</td>
+      <td>55.0 / 59.3</td>
+    </tr>
+  </tbody>
+</table>
+
+Measurements use the fixed sailboat prompt in the picker, seed 42, 832×480,
+124 frames, six steps, dynamic BF16 adapters, FA, `performance-mode speed`,
+and `quality="lossless"`. Repeated prompts reuse the exact conditioning cache.
+Saved E2E includes decoding, MP4 encoding, and file output. Memory reports the
+largest allocator-reserved peak across ranks, separately for runtime and loading.
+
+Each topology used three fresh eager processes and two each for CUDA graphs
+and compilation, with five requests per process. The first request is excluded:
+warm medians contain twelve eager or eight graph/compiled requests. Initialization
+is measured from `DiffGenerator.from_pretrained` to ready, excluding Python
+imports and weight downloads. Graph/compile initialization includes warmup;
+the benchmark's eager shape hints resolve to request warmup in its excluded
+first request. The picker eager command starts without warmup. Model and compiler
+files were cached on local NVMe; stage timing was synchronized and no other GPU
+jobs ran during measurement. These ranges are observed extrema, not confidence
+intervals. Timing applies to this workload and software build.
+
+Tested on B200 with 183359 MiB per device, driver 580.126.09, Python 3.12.16,
+PyTorch 2.14.1+cu130, Transformers 5.19.0, and Diffusers 0.37.0. CUDA graphs and
+compilation remain explicit options. The runtime already enables exact
+conditioning reuse and the inherited lossless H3 kernels; eager remains the
+startup default.
+
+## 4. Verification
+
+B200 end-to-end coverage includes all five tasks through offline generation and
+HTTP at 480p/5 seconds, 768p/15-second text generation, mixed image/video/audio
+references, two- and four-GPU Ulysses text generation, and TP2 with Ulysses2 on
+four GPUs. Breakable CUDA graph
+checks exercised real replay with changed prompts, changed reference images,
+and two canvas buckets, plus eager fallback for uncaptured frame/text shapes.
+Decoded video and audio matched eager execution exactly in those graph checks.
+
+The benchmark repeats were also identical within and across eager/graph
+processes at each fixed topology. Compiled requests repeated exactly within a
+process, but fresh compiled processes changed some generated details on the
+one-GPU and Ulysses4 configurations. Use eager for the measured speed and
+repeatability recipe; compilation does not imply identical output across starts.
+
+Both released adapters were checked against all 624 source tensors, including
+fused QKV and SwiGLU layout conversion. Base transformer weights match the
+pinned Diffusers partitions after layout mapping. The registered B200 server
+cases cover both adapter partitions; dedicated component tests compare every
+adapted projection with the source PEFT equations.
+
+Matched-input denoiser comparisons cover text, keyframe, and reference tasks
+against Pika's pinned reference. They use the reference embeddings and noise
+to isolate denoiser behavior. Native image-conditioned text embeddings show
+larger differences in a small set of rows than text-only embeddings; this is
+tracked separately from denoiser parity. Cross-runtime generation is not
+claimed to be bitwise identical.
+
+## 5. Reproducibility
+
+The loader pins Pika weights to
+`0ddf55ad7067ca1e76812253bd7b4600df87f759` and MiniMax-H3 base weights to
+`42ed227ee7df40d41602854ae760620d6eb651fe`. Validation used Pika reference code
+`4bf8ea508891a432106e70f675d287c27f02306d` in a separate PyTorch 2.13.0+cu129
+environment with its patched Diffusers requirements. Seeds use the released
+initial, renoise, and reference-augmentation streams; RNG bit identity across
+the two runtimes is not required by the reference contract.
+
+For the base model's other adapters and deployment formats, see
+[MiniMax-H3](/cookbook/diffusion/MiniMax/MiniMax-H3).

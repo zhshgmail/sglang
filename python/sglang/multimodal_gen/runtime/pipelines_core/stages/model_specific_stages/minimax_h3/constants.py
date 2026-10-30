@@ -87,3 +87,46 @@ MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG: tuple[int, float, int] = (4, 0.04, 1)
 MINIMAX_H3_REFERENCE_RESIZE_MODES: frozenset[str] = frozenset(
     {"match", "max", "diffusers"}
 )
+
+# Pinned Pika H3 Flex buckets.yaml: released output tiers and aspect labels.
+PIKA_H3_FLEX_ASPECT_RATIOS = (
+    "21:9",
+    "16:9",
+    "3:2",
+    "4:3",
+    "5:4",
+    "1:1",
+    "4:5",
+    "3:4",
+    "2:3",
+    "9:16",
+    "9:21",
+)
+PIKA_H3_FLEX_BUCKETS = {
+    480: (
+        (960, 416),
+        (832, 480),
+        (704, 480),
+        (640, 480),
+        (608, 480),
+        (480, 480),
+        (480, 608),
+        (480, 640),
+        (480, 704),
+        (480, 832),
+        (416, 960),
+    ),
+    768: (
+        (1536, 672),
+        (1344, 768),
+        (1152, 768),
+        (1024, 768),
+        (960, 768),
+        (768, 768),
+        (768, 960),
+        (768, 1024),
+        (768, 1152),
+        (768, 1344),
+        (672, 1536),
+    ),
+}

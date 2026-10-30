@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
@@ -58,6 +58,7 @@ class MiniMaxH3ReleaseMetadata:
     # PDD release: fused per-step output heads, relative to the model dir,
     # with pdd_config.json beside them
     pdd_fused_heads: str | None = None
+    sampler: Literal["euler", "renoise"] = "euler"
 
     @classmethod
     def from_model_index(
@@ -113,6 +114,11 @@ class MiniMaxH3ReleaseMetadata:
                     "strictly decreasing integers in (0, 1000]"
                 )
             dmd_steps = tuple(dmd_steps)
+        sampler = raw.get("sampler", "euler")
+        if sampler not in ("euler", "renoise"):
+            raise ValueError(
+                "model_index.json._minimax_h3.sampler must be euler or renoise"
+            )
         pdd_fused_heads = raw.get("pdd_fused_heads")
         if pdd_fused_heads is not None and (
             not isinstance(pdd_fused_heads, str)
@@ -133,6 +139,7 @@ class MiniMaxH3ReleaseMetadata:
             audio_sigma_shift=audio_sigma,
             dmd_denoising_steps=dmd_steps,
             pdd_fused_heads=pdd_fused_heads,
+            sampler=sampler,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:

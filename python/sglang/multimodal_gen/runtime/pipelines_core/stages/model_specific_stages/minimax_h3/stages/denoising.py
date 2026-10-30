@@ -9,7 +9,7 @@ import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -444,12 +444,19 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def __init__(self, transformer, pipeline=None) -> None:
+    def __init__(
+        self,
+        transformer,
+        pipeline=None,
+        *,
+        sampler: Literal["euler", "renoise"] = "euler",
+    ) -> None:
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
         )
+        self.sampler = sampler
         self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
 
@@ -783,6 +790,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 initial_video, initial_audio = _scale_pdd_initial_noise(
                     ctx, positive, initial_video, initial_audio
                 )
+            noise_generator = None
+            if self.sampler == "renoise":
+                seed = batch.sampling_params.seed
+                if isinstance(seed, list):
+                    seed = seed[0]
+                noise_generator = torch.Generator(device=device).manual_seed(
+                    int(seed) + 1
+                )
             rollout_ctx = None
             if getattr(batch, "rollout", False):
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
@@ -860,6 +875,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                     rollout_ctx=rollout_ctx,
+                    sampler=self.sampler,
+                    noise_generator=noise_generator,
                 )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
@@ -1231,6 +1248,33 @@ def _apply_condition_noise_aug(
     audio_noise_aug: float,
 ) -> None:
     """Apply condition noise augmentation to cond rows."""
+
+    if getattr(sampling, "request_policy", None) == "pika_h3_flex":
+        # The released FL2VA adapter quantizes clean latent conditioning before
+        # FP32 augmentation. Ref2VA preserves the clean FP32 latent values.
+        if ctx.cond_rows is not None:
+            clean = ctx.cond_rows
+            if ctx.plan.task != "ref2va":
+                clean = clean.to(torch.bfloat16)
+            clean = clean.float()
+            seed = ctx.plan.seed
+            if seed is None:
+                seed = (
+                    sampling.seed[0]
+                    if isinstance(sampling.seed, list)
+                    else sampling.seed
+                )
+            generator = torch.Generator(device=clean.device).manual_seed(
+                int(seed) + 7919
+            )
+            noise = torch.randn(
+                clean.shape,
+                device=clean.device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            ctx.cond_rows = imgvid_noise_aug * clean + (1.0 - imgvid_noise_aug) * noise
+        return
 
     noise_visual_conditions = (
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0
