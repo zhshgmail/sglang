@@ -692,10 +692,94 @@ def _get_multimodal_mask(
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
+# AP479: failure-only evidence, not a model repair. D2H synchronizes.
+_AP479_CAPTURED = False
+
+def _ap479_mm_failure(input_ids, placeholders, mask, embedding, items,
+                       items_size, prefixes, extends, offsets, precomputed, original_sum):
+    import json as _json
+    import os as _os
+    import time as _time
+    global _AP479_CAPTURED
+    directory = _os.environ.get("AP_MM_FAILURE479_DIR")
+    if not directory or not _os.path.isabs(directory) or _AP479_CAPTURED:
+        return
+    _AP479_CAPTURED = True  # one attempt per process, including failures/over-limit
+    limit = 256 * 1024
+    transfer_limit = 64 * 1024
+    record = {"schema": "AP479_FAILURE_ONLY_V1", "pid": _os.getpid(),
+              "monotonic_ns": _time.monotonic_ns(), "original_mask_sum": original_sum,
+              "selected_embedding_shape": list(embedding.shape),
+              "selected_precomputed": bool(precomputed),
+              "raw_encoder_rows": "UNKNOWN", "actual_cache_hit": "UNKNOWN",
+              "request_identity": "UNKNOWN; ordered metadata only",
+              "synchronization_perturbation": True}
+    try:
+        tensors = {"input_ids": input_ids, "pad_values": placeholders, "mask": mask}
+        sizes = {k: int(t.numel()) * int(t.element_size()) for k, t in tensors.items()}
+        record["tensor_payload_bytes"] = sizes
+        if sum(sizes.values()) > transfer_limit:
+            record["status"] = "UNAVAILABLE_FULL_ARRAY_LIMIT"
+        else:
+            snapshots = {}
+            for k, t in tensors.items():
+                # One CPU read per tensor, full contents or no aggregate claim.
+                c = t.detach().cpu()
+                snapshots[k] = {"dtype": str(t.dtype), "shape": list(t.shape),
+                                "values": c.reshape(-1).tolist()}
+            ids = snapshots["input_ids"]["values"]
+            pads = snapshots["pad_values"]["values"]
+            masks = snapshots["mask"]["values"]
+            if len(ids) != len(masks) or any(type(x) is not int for x in ids + pads):
+                raise ValueError("unsupported membership shape/dtype")
+            record["arrays"] = snapshots
+            record["cpu_integer_membership"] = sum(x in set(pads) for x in ids)
+            record["cpu_copied_mask_sum"] = sum(int(x) for x in masks)
+            # Bounded CPU-native metadata only; no additional device reads.
+            nodes = [0]
+            def safe(x, depth=0):
+                nodes[0] += 1
+                if nodes[0] > 4096 or depth > 8:
+                    raise ValueError("metadata limit")
+                if x is None or type(x) in (bool, int, float):
+                    return x
+                if type(x) is str and len(x) <= 256:
+                    return x
+                if type(x) in (list, tuple):
+                    return [safe(v, depth + 1) for v in x]
+                if getattr(getattr(x, "device", None), "type", None) == "cpu" and x.numel() <= 64:
+                    return safe(x.tolist(), depth + 1)
+                return "UNKNOWN_NON_CPU_OR_UNSUPPORTED"
+            record["items_size"] = safe(items_size)
+            record["prefix_length"] = safe(prefixes)
+            record["extend_length"] = safe(extends)
+            record["inclusive_offsets"] = safe(offsets)
+            record["items"] = [
+                {"pad_value": safe(i.pad_value), "offsets": safe(i.offsets),
+                 "format": str(i.format)[:128],
+                 "image_grid_thw": safe(getattr(i, "image_grid_thw", None)),
+                 "video_grid_thw": safe(getattr(i, "video_grid_thw", None))}
+                for i in items[:128]]
+            record["items_complete"] = len(items) <= 128
+            record["status"] = "FULL_ARRAYS_CAPTURED"
+    except Exception as error:
+        record = {"schema": "AP479_FAILURE_ONLY_V1", "pid": _os.getpid(),
+                  "status": "UNKNOWN_DIAGNOSTIC_ERROR", "error_type": type(error).__name__}
+    encoded = _json.dumps(record, separators=(",", ":"), allow_nan=False).encode()
+    if len(encoded) > limit:
+        encoded = _json.dumps({"schema": "AP479_FAILURE_ONLY_V1", "pid": _os.getpid(),
+                               "status": "UNAVAILABLE_SERIALIZED_LIMIT"}).encode()
+    # Explicit pre-existing owned directory; never mkdir/fallback/random tmp.
+    path = _os.path.join(directory, "mm-failure-%d.json" % _os.getpid())
+    with open(path, "xb") as stream:
+        stream.write(encoded)
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
     logger,
+    _ap479_failure=None,
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
@@ -718,9 +802,15 @@ def _adjust_embedding_length(
                 num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
                 embedding = embedding[-num_multimodal:, :]
         else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
-            )
+            try:
+                if _ap479_failure is not None:
+                    _ap479_failure(num_mm_tokens_in_input_ids)
+            finally:
+                # Preserve this original error even if evidence collection fails,
+                # including a diagnostic BaseException; no model error is caught.
+                raise RuntimeError(
+                    f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+                )
     return embedding
 
 
@@ -757,6 +847,7 @@ def get_embedding_and_mask(
     embedding = _get_precomputed_embedding(
         embedding_items, items_size, prefix_length, extend_length, items_offset_list
     )
+    _ap479_precomputed = embedding is not None
     if embedding is None:
         embedding, input_ids = _get_chunked_prefill_embedding(
             data_embedding_func,
@@ -774,7 +865,13 @@ def get_embedding_and_mask(
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
+    embedding = _adjust_embedding_length(
+        embedding, special_multimodal_mask, logger,
+        _ap479_failure=lambda original_sum: _ap479_mm_failure(
+            input_ids, placeholder_tensor, special_multimodal_mask, embedding,
+            embedding_items, items_size, prefix_length, extend_length,
+            items_offset_list, _ap479_precomputed, original_sum),
+    )
     return embedding, special_multimodal_mask, input_ids
 
 

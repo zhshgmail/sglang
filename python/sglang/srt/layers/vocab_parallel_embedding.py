@@ -45,6 +45,125 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
+# AP504: opt-in, finite, synchronizing diagnostic; NOT natural execution.
+import contextlib as _ap504_contextlib
+import contextvars as _ap504_contextvars
+import os as _ap504_os
+import json as _ap504_json
+import struct as _ap504_struct
+import hashlib as _ap504_hashlib
+import base64 as _ap504_base64
+import time as _ap504_time
+_AP504_CONTEXT = _ap504_contextvars.ContextVar('ap504_vision_position', default=None)
+_AP504_USED = False
+
+@_ap504_contextlib.contextmanager
+def ap504_scope(module, grid, *, allow=False):
+    # Identity is the actual pos_embed object in the original interpolation call.
+    token = None
+    try:
+        if allow and _ap504_os.environ.get('AP_VL_PRODUCER504') == '1':
+            token = _AP504_CONTEXT.set((module, grid))
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        if token is not None:
+            _AP504_CONTEXT.reset(token)
+
+
+def _ap504_tensor(t):
+    if tuple(t.shape) != (4, 680) or str(t.dtype) != 'torch.int64':
+        raise ValueError('unsupported shape/dtype')
+    meta = {'shape': list(t.shape), 'dtype': str(t.dtype), 'stride': list(t.stride()),
+            'storage_offset': int(t.storage_offset()), 'device': str(t.device),
+            'data_ptr': int(t.data_ptr()), 'storage_ptr': int(t.untyped_storage().data_ptr())}
+    # Exactly ONE D2H per selected tensor. tolist/packing operate on its CPU copy.
+    cpu = t.detach().cpu()
+    vals = [int(v) for row in cpu.tolist() for v in row]
+    if len(vals) != 2720:
+        raise ValueError('incomplete logical tensor')
+    raw = _ap504_struct.pack('<2720q', *vals)
+    if len(raw) != 21760:
+        raise ValueError('raw size')
+    meta.update(raw_bytes=len(raw), logical_little_endian_int64_b64=_ap504_base64.b64encode(raw).decode(),
+                sha256=_ap504_hashlib.sha256(raw).hexdigest())
+    return meta, vals
+
+
+def _ap504_begin(module, input_):
+    global _AP504_USED
+    try:
+        ctx = _AP504_CONTEXT.get()
+        if _AP504_USED or ctx is None or ctx[0] is not module:
+            return None
+        rank = get_attention_tp_rank() if module.use_attn_tp_group else get_tensor_model_parallel_rank()
+        if (rank != 2 or module.tp_size != 4 or module.num_embeddings != 2304
+                or module.embedding_dim != 1024 or tuple(input_.shape) != (4, 680)):
+            return None
+        directory = _ap504_os.environ.get('AP_VL_PRODUCER504_DIR', '')
+        if not _ap504_os.path.isabs(directory) or not _ap504_os.path.isdir(directory):
+            return None  # Explicit precreated owned output; no arbitrary tmp fallback.
+        _AP504_USED = True  # Includes failures; no repeated capture/retry.
+        rec = {'schema': 'AP504-local-diagnostic-v1', 'status': 'UNKNOWN',
+               'pid': _ap504_os.getpid(), 'tp_rank': int(rank), 'tp_size': int(module.tp_size),
+               'module_id': id(module), 'module_class': type(module).__name__,
+               'call_site': 'Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_from_list.pos_embed',
+               'tp_group_kind': 'attention' if module.use_attn_tp_group else 'tensor_model_parallel',
+               'monotonic_ns': _ap504_time.monotonic_ns(), 'directory': directory,
+               'global_num_embeddings': int(module.num_embeddings), 'embedding_dim': int(module.embedding_dim),
+               'synchronizing_D2H': True, 'max_raw_bytes': 43520}
+        try:
+            if not all(type(x) is int for x in ctx[1]) or len(ctx[1]) != 3:
+                raise ValueError('grid scalar types unsupported')
+            rec['grid_thw'] = list(ctx[1])
+            s = module.shard_indices
+            names = ('org_vocab_start_index', 'org_vocab_end_index', 'num_org_vocab_padding',
+                     'added_vocab_start_index', 'added_vocab_end_index')
+            rec['shard'] = {n: int(getattr(s, n)) for n in names}
+            rec['input'], rec['_input_values'] = _ap504_tensor(input_)
+        except Exception as exc:
+            rec['input_error'] = type(exc).__name__  # no unbounded exception messages
+        return rec
+    except Exception:
+        return None
+
+
+def _ap504_finish(rec, actual_long):
+    if rec is None:
+        return
+    try:
+        try:
+            rec['actual_long'], vals = _ap504_tensor(actual_long)
+            if '_input_values' in rec:
+                s = rec['shard']; start = s['org_vocab_start_index']; end = s['org_vocab_end_index']
+                added = s['added_vocab_start_index']; added_end = s['added_vocab_end_index']
+                offset = added - (end - start) - s['num_org_vocab_padding']
+                expected = []
+                for x in rec['_input_values']:
+                    org = start <= x < end; extra = added <= x < added_end
+                    expected.append(x - (start * int(org) + offset * int(extra)) if org or extra else 0)
+                raw = _ap504_struct.pack('<2720q', *expected)
+                rec['cpu_expected_sha256'] = _ap504_hashlib.sha256(raw).hexdigest()
+                rec['mismatch_count'] = sum(a != b for a, b in zip(expected, vals))
+                rec['input_global_outside_count'] = sum(not 0 <= x < rec['global_num_embeddings'] for x in rec['_input_values'])
+                rec['status'] = 'OBSERVED_RELATION_NOT_ROOT_CAUSE'
+        except Exception as exc:
+            rec['masked_error'] = type(exc).__name__
+        rec.pop('_input_values', None)
+        directory = rec.pop('directory')
+        rec['finished_monotonic_ns'] = _ap504_time.monotonic_ns()
+        data = _ap504_json.dumps(rec, sort_keys=True).encode()
+        if len(data) > 131072:
+            data = _ap504_json.dumps({'status':'UNKNOWN', 'reason':'metadata cap', 'pid':_ap504_os.getpid()}).encode()
+        path = _ap504_os.path.join(directory, 'ap504-pid-%d.json' % _ap504_os.getpid())
+        with open(path, 'xb') as f:
+            f.write(data)
+    except Exception:
+        pass  # diagnostic failures never replace original embedding call
+
+
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -159,7 +278,7 @@ def get_masked_input_and_mask(
         added_offset * added_vocab_mask
     )
     vocab_mask = org_vocab_mask | added_vocab_mask
-    input_ = vocab_mask * (input_ - valid_offset)
+    input_ = torch.where(vocab_mask, input_ - valid_offset, 0)
     return input_, ~vocab_mask
 
 
@@ -501,6 +620,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         maybe_detect_oob(
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
+        _ap504_record = _ap504_begin(self, input_)
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -518,7 +638,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            output_parallel = self.quant_method.embedding(self, masked_input.long())
+            _ap504_actual_long = masked_input.long()
+            _ap504_finish(_ap504_record, _ap504_actual_long)
+            output_parallel = self.quant_method.embedding(self, _ap504_actual_long)
+            del _ap504_actual_long
 
         if self.tp_size > 1:
             # Mask the output embedding.

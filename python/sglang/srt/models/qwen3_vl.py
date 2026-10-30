@@ -50,6 +50,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    ap504_scope,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
@@ -588,7 +589,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
             weights = weights.to(dtype=self.dtype)
 
-            embeds = self.pos_embed(indices)
+            with ap504_scope(
+                self.pos_embed, (t, h, w),
+                allow=not envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get(),
+            ):
+                embeds = self.pos_embed(indices)
             embeds *= weights
             combined = embeds.sum(dim=0)
 

@@ -64,6 +64,132 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+# BEGIN AUTOPORT_SAMPLER_OBSERVER607
+# Task-local observation only. Two small D2H reads can alter asynchronous timing.
+import hashlib as _ap_hash607
+import json as _ap_json607
+import os as _ap_os607
+import sys as _ap_sys607
+import time as _ap_time607
+
+_ap_claimed_pids607 = set()
+
+
+def _ap_begin607(owner, logits, info, return_logprob):
+    """Claim the first matching forward in this PID; retain no device tensor."""
+    try:
+        pid = _ap_os607.getpid()
+        run = _ap_os607.environ.get("AUTOPORT_SAMPLER_PROBE_RUN607")
+        if (_ap_os607.environ.get("AUTOPORT_SAMPLER_PROBE607") != "1"
+                or not run or pid in _ap_claimed_pids607
+                or not return_logprob or tuple(logits.shape) != (16, 151936)):
+            return None
+        _ap_claimed_pids607.add(pid)
+        context = {"pid": pid, "run": run[:160], "call": 1,
+                   "owner_id": id(owner), "phases": set(),
+                   "started_ns": _ap_time607.monotonic_ns()}
+        flags = {}
+        for name in ("is_all_greedy", "need_top_p_sampling",
+                     "need_top_k_sampling", "need_min_p_sampling"):
+            value = getattr(info, name, None)
+            flags[name] = value if isinstance(value, (bool, int, type(None))) else "UNKNOWN"
+        flags.update({
+            "sampling_seed_present": getattr(info, "sampling_seed", None) is not None,
+            "return_logprob": return_logprob,
+            "rl_on_policy_target": str(owner.rl_on_policy_target)[:128],
+            "enable_deterministic": owner.enable_deterministic,
+            "use_ascend_backend": owner.use_ascend_backend,
+            "use_log_softmax_logprob": owner.use_log_softmax_logprob,
+            "return_original_logprob": SGLANG_RETURN_ORIGINAL_LOGPROB,
+        })
+        try:
+            from sglang.srt.environ import envs as actual_envs607
+            flags["async_assert_effective"] = actual_envs607.SGLANG_ENABLE_ASYNC_ASSERT.get()
+        except Exception as error:
+            flags["async_assert_effective"] = "UNKNOWN:" + type(error).__name__
+        try:
+            context["tp_rank"] = dist.get_rank(group=owner.tp_sync_group)
+            context["tp_size"] = dist.get_world_size(group=owner.tp_sync_group)
+        except Exception as error:
+            context["tp_rank"] = "UNKNOWN:" + type(error).__name__
+        context["flags"] = flags
+        return context
+    except Exception:
+        return None
+
+
+def _ap_observe607(context, phase, ids, logits_or_logprobs, branch=None):
+    """One <=128-byte snapshot at each of two boundaries, never a repair."""
+    if context is None or phase in context["phases"]:
+        return
+    context["phases"].add(phase)
+    row = {key: value for key, value in context.items() if key != "phases"}
+    row.update({"phase": phase, "monotonic_ns": _ap_time607.monotonic_ns(),
+                "schema": "autoport.sampler-observation607/1"})
+    if branch is not None:
+        context["branch"] = row["branch"] = branch
+    try:
+        row["ids"] = {"id": id(ids), "ptr": ids.data_ptr(),
+                      "dtype": str(ids.dtype), "device": str(ids.device),
+                      "shape": list(ids.shape), "stride": list(ids.stride()),
+                      "storage_offset": ids.storage_offset(),
+                      "element_size": ids.element_size()}
+        row["matrix"] = {"id": id(logits_or_logprobs),
+                         "ptr": logits_or_logprobs.data_ptr(),
+                         "dtype": str(logits_or_logprobs.dtype),
+                         "device": str(logits_or_logprobs.device),
+                         "shape": list(logits_or_logprobs.shape),
+                         "stride": list(logits_or_logprobs.stride())}
+        if (tuple(ids.shape) != (16,) or ids.numel() * ids.element_size() > 128
+                or ids.dtype not in (torch.int32, torch.int64)):
+            row["snapshot"] = "UNKNOWN_UNSUPPORTED_GEOMETRY_OR_DTYPE"
+        else:
+            # Only this small tensor crosses devices. No logits copy or mutation.
+            host = ids.detach().to(device="cpu").contiguous()
+            raw = bytes(host.view(torch.uint8).tolist())
+            row["snapshot"] = {"values": host.tolist(), "raw_hex": raw.hex(),
+                               "bytes": len(raw),
+                               "sha256": _ap_hash607.sha256(raw).hexdigest()}
+    except Exception as error:
+        row["snapshot"] = "UNKNOWN_READ_FAILED"
+        row["error"] = type(error).__name__ + ":" + str(error)[:512]
+    try:
+        body = _ap_json607.dumps(row, sort_keys=True, separators=(",", ":"))
+        if len(body.encode("utf-8")) > 8192:
+            body = _ap_json607.dumps({"schema": row["schema"], "pid": row["pid"],
+                                     "phase": phase, "snapshot": "UNKNOWN_METADATA_LIMIT"})
+        # Owned top-level files survive Ray's separate stderr routing.
+        directory = _ap_os607.environ["AUTOPORT_SAMPLER_PROBE_DIR607"]
+        if not _ap_os607.path.isabs(directory):
+            raise ValueError("probe directory must be absolute")
+        filename = "ap607-%s-%s.json" % (row["pid"], phase)
+        final_path = _ap_os607.path.join(directory, filename)
+        temporary_path = final_path + ".part"
+        payload = (body + "\n").encode("utf-8")
+        # The body cap includes its trailing newline in this revision.
+        if len(payload) > 8192:
+            raise ValueError("probe output limit")
+        fd = _ap_os607.open(temporary_path,
+                           _ap_os607.O_WRONLY | _ap_os607.O_CREAT | _ap_os607.O_EXCL,
+                           0o600)
+        with _ap_os607.fdopen(fd, "wb") as output:
+            if output.write(payload) != len(payload):
+                raise OSError("short diagnostic write")
+            output.flush()
+            _ap_os607.fsync(output.fileno())
+        # link is exclusive: never replace an earlier complete record.
+        _ap_os607.link(temporary_path, final_path)
+        _ap_os607.unlink(temporary_path)
+        print("AUTOPORT_SAMPLER607 " + body, file=_ap_sys607.stderr, flush=True)
+    except Exception as output_error:
+        try:
+            print("AUTOPORT_SAMPLER607_OUTPUT_UNKNOWN " + type(output_error).__name__,
+                  file=_ap_sys607.stderr, flush=True)
+        except Exception:
+            pass
+# END AUTOPORT_SAMPLER_OBSERVER607
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -115,6 +241,7 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        _ap_context607 = _ap_begin607(self, logits, sampling_info, return_logprob)
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -124,6 +251,8 @@ class Sampler(nn.Module):
                 _aiter_greedy_sample(batch_next_token_ids, logits)
             else:
                 batch_next_token_ids = torch.argmax(logits, -1)
+            _ap_observe607(_ap_context607, "producer", batch_next_token_ids, logits,
+                           "greedy_aiter" if _use_aiter and not _disable_aiter_greedy_sample else "greedy_argmax")
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
@@ -159,6 +288,7 @@ class Sampler(nn.Module):
                     simple_sampling_case,
                     return_logprob,
                     positions,
+                    _ap_context607=_ap_context607,
                 )
             elif (
                 self.use_log_softmax_logprob
@@ -171,6 +301,7 @@ class Sampler(nn.Module):
                     sampling_info,
                     positions,
                 )
+                _ap_observe607(_ap_context607, "producer", batch_next_token_ids, logits, "deterministic_logprobs")
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
@@ -184,6 +315,8 @@ class Sampler(nn.Module):
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case
                 )
+                _ap_observe607(_ap_context607, "producer", batch_next_token_ids, logits,
+                               "simple_probs" if simple_sampling_case else "filtered_probs")
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
@@ -203,6 +336,7 @@ class Sampler(nn.Module):
                 token_ids_logprobs,
                 sampling_info,
                 batch_next_token_ids,
+                _ap_context607=_ap_context607,
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
@@ -323,6 +457,7 @@ class Sampler(nn.Module):
         simple_sampling_case: bool,
         return_logprob: bool,
         positions: torch.Tensor,
+        _ap_context607=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Handle the full Ascend backend sampling path.
 
@@ -337,6 +472,7 @@ class Sampler(nn.Module):
         batch_next_token_ids = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case, positions
         )
+        _ap_observe607(_ap_context607, "producer", batch_next_token_ids, logits, "ascend")
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
             logprobs = torch.log_softmax(logits, dim=-1)
@@ -350,6 +486,7 @@ class Sampler(nn.Module):
         token_ids_logprobs: List[List[int]],
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
+        _ap_context607=None,
     ):
         # clamp to avoid -inf values
         logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
@@ -369,6 +506,7 @@ class Sampler(nn.Module):
                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
             )
 
+        _ap_observe607(_ap_context607, "pre_index", batch_next_token_ids, logprobs)
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=sampling_info.device),
             batch_next_token_ids,

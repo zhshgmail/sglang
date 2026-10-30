@@ -358,6 +358,35 @@ class _EagerBufferRegistry:
     max_num_tokens: int = 0
 
 
+# AP627: host-only bounded stage receipt; no device query/synchronization.
+_ap627_count = 0
+
+def _ap627_stage(owner, stage):
+    global _ap627_count
+    try:
+        if os.environ.get("AUTOPORT_LOAD_STAGE627") != "1" or _ap627_count >= 16:
+            return
+        directory = os.environ.get("AUTOPORT_LOAD_STAGE_DIR627", "")
+        if not os.path.isabs(directory):
+            return
+        _ap627_count += 1
+        import json as _ap627_json
+        row = dict(schema="autoport.load-stage627/1", pid=os.getpid(),
+                   tid=threading.get_native_id(), tp_rank=owner.tp_rank,
+                   stage=stage, sequence=_ap627_count, monotonic_ns=time.monotonic_ns())
+        body = (_ap627_json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+        if len(body) > 1024:
+            return
+        path = os.path.join(directory, "ap627-%s-%02d.json" % (row["pid"], _ap627_count))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, body)  # A short write is incomplete evidence, never success.
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
@@ -1281,6 +1310,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def load_model(self):
+        _ap627_stage(self, "load_enter")
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
@@ -1364,26 +1394,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
+            _ap627_stage(self, "region_entered")
             self.loader = get_model_loader(
                 load_config=self.load_config,
                 model_config=self.model_config,
             )
+            _ap627_stage(self, "loader_call")
             self.model = self.loader.load_model(
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            _ap627_stage(self, "loader_return")
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+        _ap627_stage(self, "region_exit_return")
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
+            _ap627_stage(self, "empty_cache_call")
             torch.npu.empty_cache()
+            _ap627_stage(self, "empty_cache_return")
         monkey_patch_vllm_parallel_state(reverse=True)
 
         if not self.is_draft_worker:
+            _ap627_stage(self, "offloader_call")
             get_offloader().post_init()
+            _ap627_stage(self, "offloader_return")
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
@@ -1479,6 +1517,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
 
+        _ap627_stage(self, "rope_call")
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
             self.model,
@@ -1487,6 +1526,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
+        _ap627_stage(self, "rope_return_barrier_next")
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
