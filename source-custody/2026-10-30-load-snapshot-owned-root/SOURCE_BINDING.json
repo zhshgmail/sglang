@@ -1,0 +1,17 @@
+{
+  "originalAuthorCommit": "5c6877d987e1ebce63df619b2001f370be1e50f7",
+  "originalAuthorBase": "d8878ab69877066a0340b5054a22525b4990095d",
+  "originalAuthorPush": "Local bare only, not trueoffhost custody",
+  "originalAuthorCommitNotCopied": "UPSTREAM.json contains machine absolute paths. New compatible tree preserves exact sourceblob and patch, with sanitized binding.",
+  "actualUpstream": "https://github.com/sgl-project/sglang.git",
+  "sourceSupplierCommitLabel": "79c84360f8736c095cd482930572f41729ca922b; original history UNKNOWN",
+  "ownedCompatibleBaseSnapshot": "6ae0460581884004fa0747d7dd2e829829248734",
+  "compatibleBeforeSHA256": "7be3cb284dc95d3dc120cf379852a1ad10c1f3b00d73c79ee2ce0924fded8900",
+  "changedFile": "python/sglang/srt/managers/load_snapshot.py",
+  "changedFileSHA256": "a644881b8745bf4610dd05a1b632eee894b253bc5a33a060bdcdc86dd56c5f6e",
+  "originalPatchSHA256": "3e4781cba78d6ab880265d0fa72936697cd4bdaa467e9471c074d164803c6cf8",
+  "change": "Optional SGLANG_LOAD_SNAPSHOT_DIR override. Default /dev/shm unchanged.",
+  "historicalViolation": "R4 changed-code run occurred before source commit/push; remains policy violation and unreviewed, not retrospectively compliant. No subsequent changed-code run.",
+  "baseline": "Original unmodified r3 baseline freeze94cd9c23eefd6f5e58955bd09f1de613bbfd33e991ae22003fe429c25ba3be42 is separate and untouched.",
+  "claim": "Offhost source custody only. Not independent runtime qualification or wholeSlime/quality/performance/training acceptance."
+}

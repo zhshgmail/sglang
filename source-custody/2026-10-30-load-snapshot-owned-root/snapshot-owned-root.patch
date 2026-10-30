@@ -1,0 +1,14 @@
+diff --git a/python/sglang/srt/managers/load_snapshot.py b/python/sglang/srt/managers/load_snapshot.py
+index ff0ce49..11a1c80 100644
+--- a/python/sglang/srt/managers/load_snapshot.py
++++ b/python/sglang/srt/managers/load_snapshot.py
+@@ -362,7 +362,8 @@ def shm_path_for(ipc_name: str) -> str:
+     name = os.path.basename(ipc_name.rstrip("/")) or "default"
+     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+     digest = hashlib.blake2s(ipc_name.encode(), digest_size=4).hexdigest()
+-    return f"/dev/shm/sglang_loads_{safe_name}_{digest}.shm"
++    snapshot_root = os.environ.get("SGLANG_LOAD_SNAPSHOT_DIR", "/dev/shm")
++    return os.path.join(snapshot_root, f"sglang_loads_{safe_name}_{digest}.shm")
+ 
+ 
+ def file_size(dp_size: int, slot_size: int = SLOT_SIZE) -> int:
