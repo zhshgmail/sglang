@@ -734,6 +734,26 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         process_time = time.perf_counter()
 
+        # Slime sends already-expanded image tokens, including generated tokens
+        # on later turns. Decode/re-tokenize can merge a generated BPE pair.
+        # Preserve that supported input form and its image coordinates exactly.
+        if (
+            envs.SGLANG_MM_AVOID_RETOKENIZE.get()
+            and isinstance(input_text, list)
+            and image_data and len(image_data) == 1
+            and not isinstance(image_data[0], dict)
+            and not request_obj.video_data and not request_obj.audio_data
+            and len(mm_items) == 1 and mm_items[0].is_image()
+            and self._get_precomputed_mrope_from_output(ret) is None
+            and self._get_processor_output_value(ret, "padded_input_ids") is None
+        ):
+            grid = torch.as_tensor(mm_items[0].image_grid_thw)
+            positions = [i for i, token in enumerate(input_text) if token == self.mm_tokens.image_token_id]
+            count = int(grid.prod().item()) // self.hf_config.vision_config.spatial_merge_size**2
+            if grid.numel() == 3 and len(positions) == count and positions and positions[-1] - positions[0] + 1 == count:
+                input_ids = torch.tensor(input_text, dtype=input_ids.dtype, device=input_ids.device)
+                mm_items[0].offsets = [(positions[0], positions[-1])]
+
         input_ids = input_ids.flatten()
         base_input_ids = getattr(base_output, "input_ids", None)
         if (
