@@ -184,6 +184,24 @@ class Qwen3Attention(nn.Module):
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
+        if (
+            isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.rotary_emb.mrope_interleaved
+        ):
+            # Use the existing unfused primitives for interleaved multimodal
+            # RoPE on NPU; forward_native preserves all three positional axes.
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+            q, k = self.rotary_emb.forward_native(positions, q, k)
+            return q, k, v.contiguous()
+
         if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
