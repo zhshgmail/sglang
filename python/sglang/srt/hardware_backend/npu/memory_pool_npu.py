@@ -60,6 +60,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         enable_kv_cache_copy: bool = False,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_scatter_kv_cache = get_bool_env_var(
+            "SGLANG_NPU_USE_SCATTER_KV_CACHE", "False"
+        )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -171,9 +174,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.use_fia:
-            k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
-            v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
+        if self.use_fia or self.use_scatter_kv_cache:
+            # Both buffer layouts have the same flattened token order.
+            # Reuse the existing NPU scatter writer without the ATB executor cache.
+            k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.head_num, self.head_dim
+            )
+            v_buffer_layer = self.v_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.head_num, self.head_dim
+            )
 
             torch_npu.npu_scatter_nd_update_(
                 k_buffer_layer,
